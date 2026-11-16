@@ -573,8 +573,9 @@ class UpdateChecker(QThread):
     def find_update_asset(assets):
         """从 release 附件里挑更新包。
 
-        优先级：绿色包 zip（名字含 portable 的最优先）> 其它 zip > DMDP.exe。
-        zip 里带完整 runtime/app，替换后连依赖一起升级，不会出现"外层新、内层旧"。
+        优先级：DMDP.exe（单文件版，发布的主推附件）> 绿色包 zip > 其它 zip / exe。
+        单文件版更新时替换外层 DMDP.exe，靠 VERSION 标记触发自解压壳重新解压，
+        依赖也一起换新；zip 作为备用通道，能直接覆盖 runtime/app。
         返回 (直链, 字节数, 类型)，挑不到返回 ("", 0, "")。
         """
         best = None
@@ -583,10 +584,12 @@ class UpdateChecker(QThread):
             url = a.get("browser_download_url") or a.get("download_url") or ""
             if not url:
                 continue
-            if name.endswith(".zip"):
-                kind, score = "zip", (0 if "portable" in name else 1)
+            if name == "dmdp.exe":
+                kind, score = "exe", 0
+            elif name.endswith(".zip"):
+                kind, score = "zip", (1 if "portable" in name else 2)
             elif name.endswith(".exe"):
-                kind, score = "exe", (2 if name == "dmdp.exe" else 3)
+                kind, score = "exe", 3
             else:
                 continue
             if best is None or score < best[0]:
@@ -3002,7 +3005,7 @@ class DMDPWindow(QMainWindow):
         box.setIcon(QMessageBox.Icon.Information)
         box.setText(f"DMDP v{version} 已发布（当前 v{APP_VERSION}）")
         if asset:
-            what = "绿色包（含完整程序文件）" if kind == "zip" else "单文件程序"
+            what = "完整程序包（绿色包）" if kind == "zip" else "新版程序（单文件）"
             box.setInformativeText(
                 f"可以直接在程序里更新：下载{what}，退出后自动替换并重启。\n"
                 f"下载大小约 {size/1024/1024:.1f} MB（如显示 0.0 则为未知）。\n"
@@ -3297,13 +3300,14 @@ def update_selftest(verbose: bool = False) -> int:
         {"name": "DMDP-1.2.0.zip", "browser_download_url": "u4", "size": 4},
     ]
     url, size, kind = UpdateChecker.find_update_asset(assets)
-    check("优先选绿色包", (url, kind) == ("u2", "zip"), f"got={url}/{kind}")
-    url2, _, kind2 = UpdateChecker.find_update_asset([assets[0]])
-    check("只有 exe 时回退 exe", (url2, kind2) == ("u1", "exe"), f"got={url2}/{kind2}")
-    _, _, kind3 = UpdateChecker.find_update_asset([assets[2]])
-    check("装不出 zip 也不误选安装包以外", kind3 == "exe", f"got={kind3}")
+    check("优先选单文件版 DMDP.exe", (url, kind) == ("u1", "exe"), f"got={url}/{kind}")
+    url2, _, kind2 = UpdateChecker.find_update_asset([assets[1], assets[3]])
+    check("没有 exe 时用绿色包 zip", (url2, kind2) == ("u2", "zip"), f"got={url2}/{kind2}")
+    url3, _, kind3 = UpdateChecker.find_update_asset([assets[3]])
+    check("只剩源码 zip 时也能兜底", kind3 == "zip", f"got={kind3}")
     check("空附件列表", UpdateChecker.find_update_asset([]) == ("", 0, ""))
-    check("安装包不会被当更新包优先", UpdateChecker.find_update_asset([assets[2]])[0] == "u3")
+    _, _, kind4 = UpdateChecker.find_update_asset([assets[2]])
+    check("安装包排在单文件版之后", kind4 == "exe")
 
     # 2) 版本比较
     cmp_ = UpdateChecker._compare_versions
