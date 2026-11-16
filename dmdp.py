@@ -8,6 +8,7 @@ DMDP - Duck Minecraft Downloader for Plain Craft Launcher
 
 import sys
 import os
+import re
 import json
 import time
 import hashlib
@@ -528,45 +529,189 @@ class VersionListWorker(QThread):
 # ═══════════════════════════════════════════════════════════════
 
 class UpdateChecker(QThread):
-    update_found = pyqtSignal(str, str)  # version, download_url
+    # version, 页面地址, 附件直链, 字节数, 类型（zip 或 exe）
+    update_found = pyqtSignal(str, str, str, int, str)
     no_update = pyqtSignal()
     error_occurred = pyqtSignal(str)
+
+    # 仓库路径（GitHub 与 Gitee 同名）：AoLanXiang/DMDP
+    REPO = os.environ.get("DMDP_REPO", "AoLanXiang/DMDP")
+    # 先查 GitHub，失败（被墙/超时/仓库还不存在）再退回 Gitee
+    SOURCES = (
+        ("GitHub", "https://api.github.com/repos/{repo}/releases/latest", 8),
+        ("Gitee", "https://gitee.com/api/v5/repos/{repo}/releases/latest", 15),
+    )
 
     def __init__(self, channel: str = "stable", parent=None):
         super().__init__(parent)
         self.channel = channel
 
-    def run(self):
-        try:
-            # 这里可以替换为实际的 GitHub releases API
-            # url = "https://api.github.com/repos/your-repo/dmdp/releases/latest"
-            # response = requests.get(url, timeout=15)
-            # data = response.json()
-            # latest = data["tag_name"].lstrip("v")
-            # if self._compare_versions(latest, APP_VERSION) > 0:
-            #     self.update_found.emit(latest, data["html_url"])
-            # else:
-            #     self.no_update.emit()
+    def fetch_release(self):
+        """按 GitHub → Gitee 顺序取最新 release；返回 (tag, url, 来源) 或抛最后一次异常"""
+        import requests
+        last_err = None
+        for name, url_tpl, timeout in self.SOURCES:
+            try:
+                url = url_tpl.format(repo=self.REPO)
+                r = requests.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
+                if r.status_code != 200:
+                    last_err = RuntimeError(f"{name} 返回 HTTP {r.status_code}")
+                    continue
+                data = r.json()
+                tag = str(data.get("tag_name") or data.get("tag") or "")
+                link = data.get("html_url") or data.get("url") or ""
+                if not tag:
+                    last_err = RuntimeError(f"{name} 没有 tag_name")
+                    continue
+                return tag, link, self.find_update_asset(data.get("assets") or [])
+            except Exception as e:
+                last_err = RuntimeError(f"{name}: {e}")
+                continue
+        raise last_err or RuntimeError("所有更新源都不可用")
 
-            # 暂时模拟无更新
+    @staticmethod
+    def find_update_asset(assets):
+        """从 release 附件里挑更新包。
+
+        优先级：绿色包 zip（名字含 portable 的最优先）> 其它 zip > DMDP.exe。
+        zip 里带完整 runtime/app，替换后连依赖一起升级，不会出现"外层新、内层旧"。
+        返回 (直链, 字节数, 类型)，挑不到返回 ("", 0, "")。
+        """
+        best = None
+        for a in assets:
+            name = str(a.get("name") or "").lower()
+            url = a.get("browser_download_url") or a.get("download_url") or ""
+            if not url:
+                continue
+            if name.endswith(".zip"):
+                kind, score = "zip", (0 if "portable" in name else 1)
+            elif name.endswith(".exe"):
+                kind, score = "exe", (2 if name == "dmdp.exe" else 3)
+            else:
+                continue
+            if best is None or score < best[0]:
+                best = (score, url, int(a.get("size") or 0), kind)
+        if best:
+            return best[1], best[2], best[3]
+        return "", 0, ""
+
+    def run(self):
+        if not self.REPO:
             self.no_update.emit()
+            return
+        try:
+            tag, link, asset = self.fetch_release()
+            latest = self.normalize_version(tag)
+            if not latest:
+                self.error_occurred.emit(f"无法解析标签：{tag!r}")
+                return
+            if self._compare_versions(latest, APP_VERSION) > 0:
+                a_url, a_size, kind = asset
+                self.update_found.emit(latest, link, a_url, a_size, kind)
+            else:
+                self.no_update.emit()
         except Exception as e:
             self.error_occurred.emit(str(e))
 
     @staticmethod
+    def normalize_version(tag: str) -> str:
+        """把 v1.1.0 / V1.1.0 / 1.1.0-beta.1 / release-1.1.0 统一成 1.1.0（保留预发布标记）"""
+        t = (tag or "").strip()
+        t = re.sub(r"^[vV]", "", t)                    # 去掉开头的 v/V
+        m = re.search(r"(\d+(?:\.\d+)*)(?:[-_. ]?(\w[\w.]*)?)?", t)
+        if not m:
+            return ""
+        core = m.group(1)
+        pre = m.group(2) or ""
+        return f"{core}-{pre}" if pre else core
+
+    @staticmethod
+    def _parse(v: str):
+        """1.1.0-beta.1 → ((1,1,0), "beta.1")；1.1 → ((1,1), "")"""
+        v = UpdateChecker.normalize_version(v)
+        core, _, pre = v.partition("-")
+        nums = [int(x) for x in re.findall(r"\d+", core)][:4]
+        return nums, pre
+
+    @staticmethod
     def _compare_versions(v1: str, v2: str) -> int:
-        parts1 = [int(x) for x in v1.split(".")]
-        parts2 = [int(x) for x in v2.split(".")]
-        for a, b in zip(parts1, parts2):
-            if a > b:
+        """返回 1 表示 v1 更新、-1 表示 v2 更新、0 表示相同。能处理 v 前缀与预发布标记。"""
+        a, pa = UpdateChecker._parse(v1)
+        b, pb = UpdateChecker._parse(v2)
+        n = max(len(a), len(b))
+        a += [0] * (n - len(a))
+        b += [0] * (n - len(b))
+        for x, y in zip(a, b):
+            if x > y:
                 return 1
-            elif a < b:
+            if x < y:
                 return -1
-        if len(parts1) > len(parts2):
+        if pa == pb:
+            return 0
+        if not pa:      # 正式版 > 预发布版
             return 1
-        elif len(parts1) < len(parts2):
+        if not pb:
             return -1
-        return 0
+        return 1 if pa > pb else -1
+
+
+class UpdateDownloader(QThread):
+    """下载更新包（绿色包 zip 或 exe）到程序目录下的 .update 临时目录"""
+
+    progress = pyqtSignal(int, int)   # 已下载字节, 总字节
+    finished_ok = pyqtSignal(str)     # 本地文件路径
+    failed = pyqtSignal(str)
+
+    def __init__(self, url: str, size: int = 0, kind: str = "zip", parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.size = size
+        self.kind = kind or "zip"
+
+    def run(self):
+        try:
+            import requests
+            target_dir = os.path.join(app_dir(), ".update")
+            os.makedirs(target_dir, exist_ok=True)
+            tmp = os.path.join(
+                target_dir, "update.zip" if self.kind == "zip" else "DMDP-new.exe")
+            got = 0
+            total = self.size
+            with requests.get(self.url, stream=True, timeout=(15, 120),
+                              headers={"User-Agent": USER_AGENT}) as r:
+                if r.status_code != 200:
+                    self.failed.emit(f"下载失败：HTTP {r.status_code}")
+                    return
+                total = int(r.headers.get("Content-Length") or 0) or self.size
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(256 * 1024):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        got += len(chunk)
+                        self.progress.emit(got, total)
+            if total and got != total:
+                self.failed.emit(f"下载不完整：{got}/{total} 字节")
+                return
+            if self.kind == "zip":
+                import zipfile
+                if not zipfile.is_zipfile(tmp):
+                    self.failed.emit("下载回来的文件不是有效的 zip")
+                    return
+                with zipfile.ZipFile(tmp) as zf:
+                    names = zf.namelist()
+                if not any(n.replace("\\", "/").split("/")[-1].lower() == "dmdp.exe"
+                           for n in names):
+                    self.failed.emit("压缩包里没有 DMDP.exe，可能不是绿色包")
+                    return
+            else:
+                with open(tmp, "rb") as f:
+                    if f.read(2) != b"MZ":
+                        self.failed.emit("下载回来的文件不是有效的 exe")
+                        return
+            self.finished_ok.emit(tmp)
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2845,16 +2990,139 @@ class DMDPWindow(QMainWindow):
         self._update_checker.error_occurred.connect(self._on_update_error)
         self._update_checker.start()
 
-    def _on_update_found(self, version: str, url: str):
+    def _on_update_found(self, version: str, page: str, asset: str, size: int, kind: str = "zip"):
         self.title_bar.update_btn.setText("✦ 有新版本")
+        self._pending_update = (version, page, asset, size, kind)
         from PyQt6.QtWidgets import QMessageBox
+
+        if not page:
+            page = f"https://github.com/{UpdateChecker.REPO}/releases"
+        box = QMessageBox(self)
+        box.setWindowTitle("发现新版本")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(f"DMDP v{version} 已发布（当前 v{APP_VERSION}）")
+        if asset:
+            what = "绿色包（含完整程序文件）" if kind == "zip" else "单文件程序"
+            box.setInformativeText(
+                f"可以直接在程序里更新：下载{what}，退出后自动替换并重启。\n"
+                f"下载大小约 {size/1024/1024:.1f} MB（如显示 0.0 则为未知）。\n"
+                f"存档、设置和 Java 不会被覆盖。\n\n"
+                f"下载页：{page}")
+        else:
+            box.setInformativeText(f"发布里没有找到可用的更新附件（zip 或 exe），请手动下载。\n\n下载页：{page}")
+        auto_btn = box.addButton("下载并更新", QMessageBox.ButtonRole.AcceptRole) if asset else None
+        open_btn = box.addButton("打开下载页", QMessageBox.ButtonRole.ActionRole)
+        later_btn = box.addButton("稍后", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if auto_btn is not None and clicked is auto_btn:
+            self._start_update_download(asset, size, kind)
+        elif clicked is open_btn:
+            from PyQt6.QtGui import QDesktopServices
+            from PyQt6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl(page))
+
+    def _start_update_download(self, asset: str, size: int, kind: str = "zip"):
+        from PyQt6.QtWidgets import QProgressDialog
+        self._progress_dlg = QProgressDialog("正在下载新版本…", "取消", 0, 100, self)
+        self._progress_dlg.setWindowTitle("更新 DMDP")
+        self._progress_dlg.setMinimumDuration(0)
+        self._progress_dlg.setAutoClose(False)
+
+        self._downloader = UpdateDownloader(asset, size, kind)
+        self._downloader.progress.connect(self._on_update_progress)
+        self._downloader.finished_ok.connect(lambda p: self._on_update_downloaded(p, kind))
+        self._downloader.failed.connect(self._on_update_download_failed)
+        self._progress_dlg.canceled.connect(self._downloader.requestInterruption)
+        self._progress_dlg.show()
+        self._downloader.start()
+
+    def _on_update_progress(self, got: int, total: int):
+        if not hasattr(self, "_progress_dlg") or self._progress_dlg is None:
+            return
+        if total > 0:
+            self._progress_dlg.setMaximum(100)
+            self._progress_dlg.setValue(int(got * 100 / total))
+            self._progress_dlg.setLabelText(
+                f"正在下载新版本… {got/1024/1024:.1f} / {total/1024/1024:.1f} MB")
+        else:
+            self._progress_dlg.setLabelText(f"正在下载新版本… {got/1024/1024:.1f} MB")
+
+    def _on_update_download_failed(self, msg: str):
+        from PyQt6.QtWidgets import QMessageBox
+        if getattr(self, "_progress_dlg", None):
+            self._progress_dlg.close()
+        QMessageBox.warning(self, "更新失败", f"{msg}\n\n可以在浏览器里手动下载替换。")
+
+    def _on_update_downloaded(self, path: str, kind: str = "zip"):
+        from PyQt6.QtWidgets import QMessageBox
+        if getattr(self, "_progress_dlg", None):
+            self._progress_dlg.close()
+        if kind == "zip":
+            self._apply_zip_update(path, self._pending_update[0], QMessageBox)
+            return
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(self, "已下载",
+                                    f"新版本已下载到：\n{path}\n\n（开发模式不执行自动替换）")
+            return
+        target = os.path.abspath(sys.executable)
+        old = target + ".old"
+        try:
+            if os.path.exists(old):
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+            os.rename(target, old)          # Windows 允许重命名正在运行的 exe
+            try:
+                os.replace(path, target)    # 用新文件占位
+            except Exception:
+                os.rename(old, target)      # 失败回滚
+                raise
+        except Exception as e:
+            QMessageBox.warning(
+                self, "自动替换失败",
+                f"无法替换程序文件：{e}\n\n"
+                f"新版本已下载到：\n{path}\n"
+                f"请退出程序后，用这个文件覆盖当前的 DMDP.exe。")
+            return
+        from PyQt6.QtCore import QProcess
+        QProcess.startDetached(target, [])
+        QApplication.quit()
+
+    def _apply_zip_update(self, zip_path: str, version: str, QMessageBox):
+        """绿色包更新：铺到 .update\new，启动 apply.cmd，退出后自动替换并重启"""
+        import subprocess
+
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(
+                self, "已下载",
+                f"新版本已下载到：\n{zip_path}\n\n（开发模式不执行自动替换）")
+            return
+
+        prog = os.path.dirname(os.path.abspath(sys.executable))
+        try:
+            bat_path = stage_zip_update(zip_path, prog, version)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "更新包不可用",
+                f"无法准备更新：{e}\n\n请手动下载绿色包解压覆盖。\n文件：{zip_path}")
+            return
+
+        try:
+            subprocess.Popen(["cmd", "/c", bat_path],
+                             creationflags=0x00000008 | 0x00000200,
+                             close_fds=True)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "更新需要手动完成",
+                f"无法启动替换脚本：{e}\n\n请手动用这个绿色包解压覆盖：\n{zip_path}")
+            return
+
         QMessageBox.information(
-            self, "发现新版本",
-            f"DMDP {version} 已发布！\n\n"
-            f"当前版本: v{APP_VERSION}\n"
-            f"最新版本: v{version}\n\n"
-            f"请前往下载页面获取更新。"
-        )
+            self, "即将更新",
+            f"DMDP v{version} 已下载完成。\n\n程序现在会退出，几秒后自动重启到新版本。")
+        QApplication.quit()
 
     def _on_no_update(self):
         self.title_bar.update_btn.setText("⟳ 检查更新")
@@ -2919,10 +3187,277 @@ def selftest() -> int:
     )
     window.close()
     app.quit()
+
+    # 自更新链路自检（附件挑选 / 版本比较 / 解压校验 / 替换脚本 / 存档安全）
+    rc = update_selftest(verbose=("--verbose" in sys.argv))
+    return rc
+
+
+# apply.cmd 里替换的文件清单：只动程序文件，绝不碰 .minecraft / PCL / 设置
+UPDATE_KEEP_NAMES = (".minecraft", "PCL", "settings.json", "logs", "crash-reports")
+
+
+def stage_zip_update(zip_path: str, prog_dir: str, version: str) -> str:
+    """把绿色包解压到 <prog>/.update/new 并生成 apply.cmd，返回脚本路径。
+
+    纯文件操作、不碰 Qt，便于自检。解压后校验：必须有 DMDP.exe、runtime/、app/。
+    替换范围仅限 runtime/、app/、DMDP.exe 与三个说明文件，用户目录一律不动。
+    """
+    import shutil
+    import zipfile
+
+    upd_dir = os.path.join(prog_dir, ".update")
+    new_dir = os.path.join(upd_dir, "new")
+    if os.path.isdir(new_dir):
+        shutil.rmtree(new_dir, ignore_errors=True)
+    os.makedirs(new_dir, exist_ok=True)
+
+    with zipfile.ZipFile(zip_path) as zf:
+        names = [n for n in zf.namelist() if n and not n.endswith("/")]
+        if not names:
+            raise RuntimeError("压缩包是空的")
+        tops = {n.replace("\\", "/").split("/")[0] for n in names}
+        first = names[0].replace("\\", "/")
+        strip = len(tops) == 1 and "/" in first
+        for n in names:
+            src = n.replace("\\", "/")
+            if src.startswith("../") or src.startswith("/"):
+                raise RuntimeError(f"压缩包里有非法路径：{n}")
+            parts = src.split("/")
+            rel = os.path.join(*parts[1:]) if strip and len(parts) > 1 else src
+            dst = os.path.join(new_dir, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with zf.open(n) as rf, open(dst, "wb") as wf:
+                shutil.copyfileobj(rf, wf)
+
+    if not os.path.isfile(os.path.join(new_dir, "DMDP.exe")):
+        raise RuntimeError("解压后找不到 DMDP.exe")
+    for sub in ("runtime", "app"):
+        if not os.path.isdir(os.path.join(new_dir, sub)):
+            raise RuntimeError(f"绿色包不完整（缺 {sub}\\）")
+
+    # 单文件版布局（外层 DMDP.exe + 内层 DMDP\）要同步写 VERSION，
+    # 否则外层自解压壳会认为版本没变、不去重新解压
+    has_outer = os.path.isfile(os.path.join(os.path.dirname(prog_dir.rstrip("\\")), "DMDP.exe"))
+    ver_line = f'echo {version}>"%DST%\\VERSION"' if has_outer else "rem VERSION 无需更新"
+
+    lines = [
+        "@echo off",
+        "setlocal",
+        "chcp 65001 >nul",
+        'set "SRC=%~dp0new"',
+        f'set "DST={prog_dir}"',
+        ":wait",
+        'tasklist /FI "IMAGENAME eq DMDP.exe" 2>nul | find /I "DMDP.exe" >nul',
+        "if not errorlevel 1 (",
+        "  timeout /t 1 /nobreak >nul",
+        "  goto wait",
+        ")",
+        'if exist "%DST%\\DMDP.exe.old" del /f /q "%DST%\\DMDP.exe.old" >nul 2>nul',
+        'robocopy "%SRC%\\runtime" "%DST%\\runtime" /MIR /NFL /NDL /NJH /NJS /NP >nul',
+        'robocopy "%SRC%\\app" "%DST%\\app" /MIR /NFL /NDL /NJH /NJS /NP >nul',
+        'if exist "%SRC%\\DMDP.exe" copy /Y "%SRC%\\DMDP.exe" "%DST%\\DMDP.exe" >nul',
+        'if exist "%SRC%\\README.md" copy /Y "%SRC%\\README.md" "%DST%\\" >nul',
+        'if exist "%SRC%\\使用说明.txt" copy /Y "%SRC%\\使用说明.txt" "%DST%\\" >nul',
+        ver_line,
+        'start "" "%DST%\\DMDP.exe"',
+    ]
+    bat_path = os.path.join(upd_dir, "apply.cmd")
+    with open(bat_path, "w", encoding="utf-8", newline="") as f:
+        f.write("\r\n".join(lines) + "\r\n")
+    return bat_path
+
+
+def update_selftest(verbose: bool = False) -> int:
+    """自更新自检：附件挑选、版本比较、解压校验、替换脚本内容、用户目录不被碰。
+
+    返回 0 表示全部通过，非 0 表示有失败项。用 --selftest 时会自动跑。
+    """
+    import shutil
+    import tempfile
+    import zipfile
+
+    fails = []
+
+    def check(name, cond, detail=""):
+        if cond:
+            if verbose:
+                print(f"  [ok] {name}")
+        else:
+            fails.append(f"{name} {detail}".strip())
+            print(f"  [FAIL] {name} {detail}")
+
+    print("[update-selftest] 开始", flush=True)
+
+    # 1) 附件优先级：绿色包 > 其它 zip > DMDP.exe > 别的 exe
+    assets = [
+        {"name": "DMDP.exe", "browser_download_url": "u1", "size": 1},
+        {"name": "DMDP-1.2.0-win64-portable.zip", "browser_download_url": "u2", "size": 2},
+        {"name": "DMDP-1.2.0-setup.exe", "browser_download_url": "u3", "size": 3},
+        {"name": "DMDP-1.2.0.zip", "browser_download_url": "u4", "size": 4},
+    ]
+    url, size, kind = UpdateChecker.find_update_asset(assets)
+    check("优先选绿色包", (url, kind) == ("u2", "zip"), f"got={url}/{kind}")
+    url2, _, kind2 = UpdateChecker.find_update_asset([assets[0]])
+    check("只有 exe 时回退 exe", (url2, kind2) == ("u1", "exe"), f"got={url2}/{kind2}")
+    _, _, kind3 = UpdateChecker.find_update_asset([assets[2]])
+    check("装不出 zip 也不误选安装包以外", kind3 == "exe", f"got={kind3}")
+    check("空附件列表", UpdateChecker.find_update_asset([]) == ("", 0, ""))
+    check("安装包不会被当更新包优先", UpdateChecker.find_update_asset([assets[2]])[0] == "u3")
+
+    # 2) 版本比较
+    cmp_ = UpdateChecker._compare_versions
+    check("v1.2.0 > 1.1.0", cmp_("v1.2.0", "1.1.0") == 1)
+    check("1.1.0 == V1.1.0", cmp_("V1.1.0", "1.1.0") == 0)
+    check("beta < 正式", cmp_("1.1.0-beta.1", "1.1.0") == -1)
+    check("release-1.3.0 解析", UpdateChecker.normalize_version("release-1.3.0") == "1.3.0")
+
+    tmp = tempfile.mkdtemp(prefix="dmdp-selftest-")
+    try:
+        # 3) 造一个绿色包（带一层顶部目录，模拟真实打包）
+        port = os.path.join(tmp, "DMDP-portable")
+        os.makedirs(os.path.join(port, "runtime"))
+        os.makedirs(os.path.join(port, "app"))
+        open(os.path.join(port, "DMDP.exe"), "wb").write(b"MZfake")
+        open(os.path.join(port, "runtime", "python312.dll"), "wb").write(b"dll")
+        open(os.path.join(port, "app", "dmdp.py"), "w").write("# fake")
+        open(os.path.join(port, "README.md"), "w").write("readme")
+        zip_path = os.path.join(tmp, "pkg.zip")
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            for root, _, fs in os.walk(port):
+                for f in fs:
+                    full = os.path.join(root, f)
+                    zf.write(full, os.path.relpath(full, tmp))
+
+        # 4) 铺开：绿色版布局（prog 目录里直接有 exe/runtime/app）
+        prog = os.path.join(tmp, "prog")
+        os.makedirs(os.path.join(prog, ".minecraft", "saves"))
+        open(os.path.join(prog, ".minecraft", "saves", "world.dat"), "w").write("save")
+        os.makedirs(os.path.join(prog, "runtime"))
+        open(os.path.join(prog, "runtime", "old-only.dll"), "wb").write(b"old")
+        os.makedirs(os.path.join(prog, "app"))
+        open(os.path.join(prog, "app", "dmdp.py"), "w").write("# old")
+
+        bat = stage_zip_update(zip_path, prog, "1.2.0")
+        new_dir = os.path.join(prog, ".update", "new")
+        check("解压后 DMDP.exe 在", os.path.isfile(os.path.join(new_dir, "DMDP.exe")))
+        check("顶层目录被剥掉", not os.path.isdir(os.path.join(new_dir, "DMDP-portable")))
+        check("runtime 完整", os.path.isdir(os.path.join(new_dir, "runtime")))
+        check("app 完整", os.path.isdir(os.path.join(new_dir, "app")))
+        check("apply.cmd 已生成", os.path.isfile(bat))
+
+        bat_text = open(bat, encoding="utf-8", newline="").read()
+        check("脚本用 robocopy 镜像 runtime", "/MIR" in bat_text and "runtime" in bat_text)
+        check("脚本会等待进程退出", "tasklist" in bat_text and "goto wait" in bat_text)
+        check("脚本会重启程序", "start" in bat_text)
+        check("脚本不碰 .minecraft", ".minecraft" not in bat_text)
+        check("脚本没有整目录删除", "rd /s" not in bat_text.lower())
+        check("绿色版布局不写 VERSION", "rem VERSION" in bat_text)
+        check("CRLF 行尾", "\r\n" in bat_text)
+
+        # 5) 单文件版布局：外层 exe + 内层 DMDP\
+        outer = os.path.join(tmp, "outer")
+        inner = os.path.join(outer, "DMDP")
+        os.makedirs(inner)
+        open(os.path.join(outer, "DMDP.exe"), "wb").write(b"MZouter")
+        bat2 = stage_zip_update(zip_path, inner, "1.2.0")
+        check("单文件版布局会写 VERSION",
+              "VERSION" in open(bat2, encoding="utf-8", newline="").read())
+        shutil.rmtree(os.path.join(inner, ".update"), ignore_errors=True)
+
+        # 6) 模拟 robocopy /MIR 的替换结果：只改程序文件，存档保持
+        def mirror(src, dst):
+            if os.path.isdir(dst):
+                for name in os.listdir(dst):
+                    p = os.path.join(dst, name)
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        os.remove(p)
+            os.makedirs(dst, exist_ok=True)
+            for name in os.listdir(src):
+                a = os.path.join(src, name)
+                b = os.path.join(dst, name)
+                if os.path.isdir(a):
+                    mirror(a, b)
+                else:
+                    shutil.copyfile(a, b)
+
+        mirror(os.path.join(new_dir, "runtime"), os.path.join(prog, "runtime"))
+        mirror(os.path.join(new_dir, "app"), os.path.join(prog, "app"))
+        shutil.copyfile(os.path.join(new_dir, "DMDP.exe"), os.path.join(prog, "DMDP.exe"))
+        check("runtime 已升级", os.path.isfile(os.path.join(prog, "runtime", "python312.dll")))
+        check("runtime 旧文件被清", not os.path.exists(os.path.join(prog, "runtime", "old-only.dll")))
+        check("app 已升级", open(os.path.join(prog, "app", "dmdp.py")).read() == "# fake")
+        check(".minecraft 存档还在",
+              os.path.isfile(os.path.join(prog, ".minecraft", "saves", "world.dat")))
+
+        # 7) 收尾清理
+        cleanup_update_leftovers_in(prog)
+        check(".update 已清理", not os.path.isdir(os.path.join(prog, ".update")))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if fails:
+        print(f"[update-selftest] 失败 {len(fails)} 项：" + "; ".join(fails), flush=True)
+        return 1
+    print("[update-selftest] 全部通过", flush=True)
     return 0
 
 
+def cleanup_update_leftovers_in(base_dir: str):
+    """收尾指定目录下的 .update 与 *.old（自检用；正式入口见 cleanup_update_leftovers）"""
+    import shutil
+    upd = os.path.join(base_dir, ".update")
+    if os.path.isdir(upd):
+        for name in os.listdir(upd):
+            path = os.path.join(upd, name)
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+            except OSError:
+                pass
+        try:
+            os.rmdir(upd)
+        except OSError:
+            pass
+
+
+def cleanup_update_leftovers():
+    """启动时收尾：删掉自更新留下的 DMDP.exe.old 和 .update 临时目录"""
+    try:
+        exe = os.path.abspath(sys.executable) if getattr(sys, "frozen", False) else None
+        if exe:
+            old = exe + ".old"
+            if os.path.isfile(old):
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+        upd = os.path.join(app_dir(), ".update")
+        if os.path.isdir(upd):
+            import shutil
+            for name in os.listdir(upd):
+                path = os.path.join(upd, name)
+                try:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        os.remove(path)
+                except OSError:
+                    pass
+            try:
+                os.rmdir(upd)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def main():
+    cleanup_update_leftovers()
     if "--selftest" in sys.argv:
         sys.exit(selftest())
 

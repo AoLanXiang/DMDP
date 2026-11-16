@@ -1,0 +1,61 @@
+name: Build DMDP
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller>=6.6
+
+      - name: 1) 打带控制台的自检版
+        run: python build.py --console
+
+      - name: 2) 运行自检（验证 PyQt6 / 引擎 / 界面都能加载）
+        run: |
+          .\dist\DMDP-selftest.exe --selftest
+        shell: cmd
+
+      - name: 3) 打正式版（无控制台）
+        run: python build.py
+
+      - name: 4) 生成校验值与说明文件
+        run: |
+          python -c "import hashlib,pathlib; p=pathlib.Path('dist/DMDP.exe'); print('SHA256', hashlib.sha256(p.read_bytes()).hexdigest())" | Tee-Object -FilePath dist/SHA256.txt
+
+      - name: 5) 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: DMDP-win64
+          path: |
+            dist/DMDP.exe
+            dist/SHA256.txt
+            README.md
+            LICENSE
+
+      - name: 6) 打 tag 时自动发布 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/DMDP.exe
+            dist/SHA256.txt
+          draft: false
+          generate_release_notes: true

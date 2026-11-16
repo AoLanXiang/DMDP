@@ -251,3 +251,25 @@ build.py           PyInstaller 打包脚本
 requirements.txt   运行依赖
 .github/workflows/build.yml   GitHub Actions 自动构建
 ```
+
+## 更新检查（GitHub 优先，Gitee 兜底）
+
+查询顺序：
+
+1. `https://api.github.com/repos/AoLanXiang/DMDP/releases/latest`（超时 8 秒）
+2. 拿不到（被墙、超时、仓库还没建）就退到 `https://gitee.com/api/v5/repos/AoLanXiang/DMDP/releases/latest`（超时 15 秒）
+
+仓库路径写在 `dmdp.py` 的 `UpdateChecker.REPO`，可用环境变量 `DMDP_REPO` 覆盖。
+两个源都不通时只报错误、不误报「已是最新」。
+
+tag 用 `v1.1.0` 没问题：代码会剥掉 `v`/`V`，也认 `release-1.1.0`，并区分 `1.1.0-beta.1` 与正式版。
+
+> 注意：GitHub 优先意味着国内网络下通常会先卡 8 秒再落到 Gitee。如果嫌慢，
+> 把 `SOURCES` 里两条顺序对调即可，一行改动。
+
+## 关于发版
+
+源码包只包含程序本身（`dmdp.py`、`dmdp_engine.py`、`build.py`、`packaging/`、文档与许可）。
+发版用的上传脚本和给接手者看的内部说明**不随源码分发**，由维护者单独保存。
+
+发版时请确保 release 附件里有一个准确命名为 `DMDP.exe` 的文件 —— 程序自更新按这个名字找直链。
