@@ -51,6 +51,7 @@ import dmdp_engine as engine
 APP_NAME = "DMDP"
 APP_FULL_NAME = "Duck Minecraft Downloader for Plain Craft Launcher"
 APP_VERSION = engine.APP_VERSION
+USER_AGENT = engine.USER_AGENT  # 请求头，GitHub / Gitee API 都要求带
 
 # 主题色
 COLOR_BLUE = "#4A90D9"
