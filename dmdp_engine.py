@@ -60,7 +60,7 @@ from minecraft_launcher_lib.natives import get_natives, extract_natives_file
 # ═══════════════════════════════════════════════════════════════
 
 APP_NAME = "DMDP"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 USER_AGENT = f"DMDP/{APP_VERSION}"
 
 SOURCE_BMCLAPI = "bmclapi"
@@ -299,6 +299,10 @@ class DownloadStats:
         self.files_done = 0
         self.current_file = ""
         self.speed = 0.0
+        self.stage_name = ""
+        self.stage_total = 0
+        self.stage_done = 0
+        self.stage_start_files = 0
         self.start_time = time.time()
         self._samples = deque(maxlen=16)
 
@@ -344,6 +348,9 @@ class DownloadStats:
                 "current": self.current_file,
                 "speed": self.speed,
                 "elapsed": time.time() - self.start_time,
+                "stage": self.stage_name,
+                "stage_total": self.stage_total,
+                "stage_done": max(0, self.files_done - self.stage_start_files),
             }
 
 
@@ -417,6 +424,13 @@ class DownloadManager:
     def cancel(self):
         self.stop_event.set()
         self._status("正在取消…")
+
+    def begin_stage(self, name: str, total_files: int = 0, count_from_done: bool = True):
+        """标记当前阶段，供界面显示「本阶段进度」。"""
+        with self.stats.lock:
+            self.stats.stage_name = str(name)
+            self.stats.stage_total = int(total_files or 0)
+            self.stats.stage_start_files = self.stats.files_done
 
     def _status(self, text: str):
         if self.on_status:
@@ -785,7 +799,7 @@ class DownloadManager:
         self._log(f"共 {len(uniq)} 个文件，"
                   f"{self.max_workers} 线程并发"
                   f"{f'，单文件最大 {self.chunk_size} 分片' if self.chunk_size > 1 else ''}")
-        self._status("下载文件")
+        # 阶段名由调用方设定，这里不再覆盖
 
         futures = {self._file_pool.submit(self.fetch, it, overwrite): it for it in uniq.values()}
         first_error = None
@@ -1023,14 +1037,14 @@ def build_install_plan(version: str, mc_dir: str,
     version_id = data.get("id") or version
 
     if status:
-        status("解析 libraries 清单")
+        status("下载游戏资源库")
     for lib in data.get("libraries") or []:
         lib_items, lib_natives = _library_items(lib, version_id, mc_dir)
         items += lib_items
         natives += lib_natives
 
     if status:
-        status("解析 assets 清单")
+        status("下载游戏资源文件")
     items += _asset_items(data, mc_dir, manager, status)
 
     logging_cfg = (data.get("logging") or {}).get("client") or {}
@@ -1059,9 +1073,13 @@ def install_version(version: str, mc_dir: str, manager: DownloadManager,
     """完整安装一个原版版本：解析清单 → 并发下载 → 解压 natives。"""
     os.makedirs(mc_dir, exist_ok=True)
     plan, data, natives = build_install_plan(version, mc_dir, manager, status)
+    if status:
+        status("下载游戏文件")
+    manager.begin_stage("下载游戏文件", len(plan))
     manager.download_all(plan)
 
     if natives:
+        manager.begin_stage("解压 natives", len(natives))
         manager._status("解压 natives")
         for jar, dest, rules in natives:
             if os.path.isfile(jar):
@@ -1253,6 +1271,7 @@ def install_mod_loader(loader_id: str, mc_version: str, mc_dir: str,
             "请在「设置 → Java」里指定 java.exe，或打开「自动下载 Java 运行库」。"
         )
 
+    manager.begin_stage(f"安装 {LOADER_NAMES.get(loader_id, loader_id)}")
     manager._status(f"安装 {LOADER_NAMES.get(loader_id, loader_id)}")
     manager._log(f"使用 Java: {java}")
 
@@ -1271,13 +1290,111 @@ def install_mod_loader(loader_id: str, mc_version: str, mc_dir: str,
         java=java,
     )
     manager._log(f"加载器已安装为版本 {installed_id}")
+    # 安装器会额外生成一个同名 profile 目录（versions/fabric-loader 等），
+    # PCL2 会把它当成另一个版本，导致版本列表里出现重复项，这里清掉。
+    _clean_loader_leftovers(loader_id, mc_dir, installed_id, manager)
     return installed_id
+
+
+# 安装器残留的 profile 目录名（不带版本号），只有正式版本 id 存在时才删除
+_LOADER_LEFTOVER_DIRS = {
+    "fabric": ["fabric-loader"],
+    "quilt": ["quilt-loader"],
+}
+
+
+def _clean_loader_leftovers(loader_id: str, mc_dir: str, installed_id: str,
+                            manager: Optional[DownloadManager] = None):
+    names = _LOADER_LEFTOVER_DIRS.get(loader_id) or []
+    if not names or not installed_id:
+        return
+    versions_dir = os.path.join(mc_dir, "versions")
+    official_dir = os.path.join(versions_dir, installed_id)
+    if not os.path.isdir(official_dir):
+        return  # 正式版本目录不存在，说明名字对不上，别乱删
+    for name in names:
+        if name == installed_id:
+            continue
+        d = os.path.join(versions_dir, name)
+        if not os.path.isdir(d):
+            continue
+        try:
+            shutil.rmtree(d)
+            if manager:
+                manager._log(f"已清理安装器残留目录 versions/{name}")
+        except Exception as e:  # noqa: BLE001
+            if manager:
+                manager._log(f"清理 versions/{name} 失败: {e}")
+
+
+def install_fabric_api(mc_version: str, mc_dir: str, manager: DownloadManager) -> bool:
+    """给 Fabric 版本装 Fabric API（mods/fabric-api-*.jar），失败不致命。"""
+    try:
+        api = "https://api.modrinth.com/v2/project/fabric-api/version"
+        params = {
+            "game_versions": json.dumps([mc_version]),
+            "loaders": json.dumps(["fabric"]),
+        }
+        r = manager._session().get(api, params=params, timeout=15)
+        if r.status_code != 200:
+            return False
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            return False
+        files = (data[0] or {}).get("files") or []
+        if not files:
+            return False
+        f = files[0]
+        mods_dir = os.path.join(mc_dir, "mods")
+        os.makedirs(mods_dir, exist_ok=True)
+        dest = os.path.join(mods_dir, f.get("filename") or "fabric-api.jar")
+        manager.fetch(FileItem(url=f["url"], path=dest,
+                               size=f.get("size"), sha1=None), overwrite=True)
+        manager._log(f"已安装 Fabric API: {os.path.basename(dest)}")
+        return True
+    except Exception as e:  # noqa: BLE001
+        if manager:
+            manager._log(f"Fabric API 安装跳过: {e}")
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════
 #  minecraft-launcher-lib 补丁
 #  （加载器安装器、Java 运行时等内部下载同样走镜像 / 分片 / 限速）
 # ═══════════════════════════════════════════════════════════════
+
+# ── 屏蔽子进程控制台窗口 ─────────────────────────────────────
+# Forge/Fabric/Quilt 安装器、Java 运行时探测在 Windows 上会弹出黑框，
+# 后段一次起几十个，能把资源管理器拖到无响应。这里统一给 subprocess 加上
+# CREATE_NO_WINDOW + 隐藏 STARTUPINFO，任何库调用都被覆盖。
+
+_NO_WINDOW_PATCHED = False
+
+
+def patch_subprocess_no_window():
+    global _NO_WINDOW_PATCHED
+    if _NO_WINDOW_PATCHED or os.name != "nt":
+        return
+    import subprocess as _sp
+
+    _orig_popen = _sp.Popen
+
+    def _popen_no_window(*args, **kwargs):
+        flags = kwargs.get("creationflags", 0)
+        kwargs["creationflags"] = flags | 0x08000000  # CREATE_NO_WINDOW
+        if os.name == "nt":
+            si = kwargs.get("startupinfo") or _sp.STARTUPINFO()
+            si.dwFlags |= _sp.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0  # SW_HIDE
+            kwargs["startupinfo"] = si
+        return _orig_popen(*args, **kwargs)
+
+    _sp.Popen = _popen_no_window
+    _NO_WINDOW_PATCHED = True
+
+
+patch_subprocess_no_window()
+
 
 _manager_provider: Optional[Callable[[], Optional[DownloadManager]]] = None
 _patched_modules: set = set()

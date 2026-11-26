@@ -43,6 +43,7 @@ from PyQt6.QtGui import (
 
 # 本地下载引擎：BMCLAPI 镜像 / 多文件并发 / 单文件分片 / 字节级进度 / Mod 加载器
 import dmdp_engine as engine
+import ui_icons
 
 # ═══════════════════════════════════════════════════════════════
 #  常量
@@ -52,6 +53,34 @@ APP_NAME = "DMDP"
 APP_FULL_NAME = "Duck Minecraft Downloader for Plain Craft Launcher"
 APP_VERSION = engine.APP_VERSION
 USER_AGENT = engine.USER_AGENT  # 请求头，GitHub / Gitee API 都要求带
+
+
+# ═══════════════════════════════════════════════════════════════
+#  图标（QPainter 自绘，不依赖图片文件或 emoji 字体）
+# ═══════════════════════════════════════════════════════════════
+
+def icon_label(name: str, size: int = 18, color: str = "#4A90D9") -> "QLabel":
+    lbl = QLabel()
+    lbl.setPixmap(ui_icons.icon_pixmap(name, size, color))
+    lbl.setFixedSize(size, size)
+    lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    return lbl
+
+
+def app_icon() -> "QIcon":
+    """程序图标：优先用打包的鸭子 ico/png，取不到就退回自绘鸭子。"""
+    for rel in (("assets", "app.png"), ("assets", "app.ico")):
+        p = os.path.join(app_dir(), *rel)
+        if os.path.isfile(p):
+            return QIcon(p)
+    return QIcon(ui_icons.icon_pixmap("duck", 128))
+
+
+def set_icon(btn, name: str, size: int = 16, color: str = "#4A90D9"):
+    from PyQt6.QtGui import QIcon
+    btn.setText("")
+    btn.setIcon(QIcon(ui_icons.icon_pixmap(name, size, color)))
+    return btn
 
 # 主题色
 COLOR_BLUE = "#4A90D9"
@@ -192,7 +221,16 @@ def _drive_roots() -> list:
 
 def _pcl_search_roots() -> list:
     """PCL2 最可能出现的几个起点：程序目录、用户目录及其常用子目录、各盘根目录。"""
-    roots = [app_dir()]
+    # 关键：单文件版运行在 $EXEDIR\DMDP 里面，PCL2 往往就在外层 EXEDIR 的子目录，
+    # 所以把 app_dir 本身、以及它往上的两级目录都作为起点。
+    base = app_dir()
+    roots = [base]
+    for _ in range(2):
+        parent = os.path.dirname(base)
+        if not parent or parent == base:
+            break
+        roots.append(parent)
+        base = parent
     home = os.path.expanduser("~")
     for sub in ("Desktop", "Downloads", "Documents", "桌面", "下载", "文档"):
         p = os.path.join(home, sub)
@@ -213,7 +251,44 @@ def _pcl_search_roots() -> list:
     return out
 
 
-def find_pcl2_dirs(max_depth: int = 2, time_budget: float = 8.0) -> list:
+def _scan_tree_deep(root: str, max_depth: int, deadline: float,
+                    found: dict, seen: set):
+    """从 root 往下找 PCL2，优先返回（程序附近通常不深）。"""
+    queue = deque([(root, 0)])
+    while queue:
+        if time.monotonic() > deadline:
+            return
+        path, depth = queue.popleft()
+        try:
+            key = os.path.normcase(os.path.abspath(path))
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            entries = list(os.scandir(path))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                name = entry.name.lower()
+                if entry.is_file():
+                    rank = _pcl_exe_rank(entry.name)
+                    if rank is not None:
+                        old = found.get(path)
+                        if old is None or rank < old[0]:
+                            found[path] = (rank, entry.name)
+                elif entry.is_dir(follow_symlinks=False):
+                    if name in _SKIP_DIR_NAMES or name.startswith("$"):
+                        continue
+                    if depth < max_depth:
+                        queue.append((entry.path, depth + 1))
+            except OSError:
+                continue
+
+
+def find_pcl2_dirs(max_depth: int = 3, time_budget: float = 12.0) -> list:
     """广度优先扫描，返回包含 PCL2 主程序的目录列表。
 
     max_depth 控制向下几层；time_budget 是总时间上限（秒），到点就返回已找到的结果，
@@ -222,6 +297,14 @@ def find_pcl2_dirs(max_depth: int = 2, time_budget: float = 8.0) -> list:
     deadline = time.monotonic() + max(1.0, time_budget)
     found = {}          # 目录 -> (优先级, 命中文件名)
     seen = set()
+
+    # 第一轮：只在程序所在目录附近深挖（浅层、快，命中率最高）
+    near_deadline = min(deadline, time.monotonic() + max(2.0, time_budget * 0.4))
+    for r in _pcl_search_roots()[:4]:
+        _scan_tree_deep(r, max_depth + 1, near_deadline, found, seen)
+    if found:
+        return _rank_pcl_dirs(found)
+
     queue = deque((r, 0) for r in _pcl_search_roots())
 
     while queue:
@@ -256,6 +339,10 @@ def find_pcl2_dirs(max_depth: int = 2, time_budget: float = 8.0) -> list:
             except OSError:
                 continue
 
+    return _rank_pcl_dirs(found)
+
+
+def _rank_pcl_dirs(found: dict) -> list:
     # 去重：junction / 软链接指向同一目录时只保留最短的那个写法
     uniq = {}
     for d, info in found.items():
@@ -393,8 +480,8 @@ class PCLScanWorker(QThread):
     def run(self):
         try:
             dirs = find_pcl2_dirs(
-                max_depth=3 if self._deep else 1,
-                time_budget=15.0 if self._deep else 5.0,
+                max_depth=4 if self._deep else 2,
+                time_budget=15.0 if self._deep else 8.0,
             )
         except Exception:
             dirs = []
@@ -408,6 +495,7 @@ class DownloadWorker(QThread):
     progress_changed = pyqtSignal(int, int)      # 已下载字节 / 总字节
     speed_updated = pyqtSignal(float)            # MB/s
     detail_changed = pyqtSignal(str, int, int)   # 当前文件, 已完成文件数, 文件总数
+    stage_changed = pyqtSignal(str, int, int)    # 阶段名, 本阶段已完成, 本阶段总数
     download_finished = pyqtSignal(str, bool)    # 任务版本, 是否成功
     error_occurred = pyqtSignal(str, str)
     log_message = pyqtSignal(str)
@@ -462,6 +550,10 @@ class DownloadWorker(QThread):
                 self.installed_version = engine.install_mod_loader(
                     self.loader_id, self.version_id, self.mc_dir,
                     self.loader_version, manager, data)
+                if self.loader_id in ("fabric", "quilt") and not manager.stop_event.is_set():
+                    self.status_changed.emit("安装 Fabric API")
+                    engine.install_fabric_api(
+                        self.version_id, self.mc_dir, manager)
 
             if manager.stop_event.is_set():
                 self.download_finished.emit(self.version_id, False)
@@ -486,6 +578,9 @@ class DownloadWorker(QThread):
         self.progress_changed.emit(int(snap["done"]), int(snap["total"]))
         self.speed_updated.emit(self._last_speed)
         self.detail_changed.emit(self._current_file, self._files_done, self._files_total)
+        self.stage_changed.emit(str(snap.get("stage", "")),
+                                int(snap.get("stage_done", 0)),
+                                int(snap.get("stage_total", 0)))
 
 
 class LoaderVersionWorker(QThread):
@@ -749,14 +844,13 @@ class TitleBar(QWidget):
         left_layout.setSpacing(8)
 
         # 鸭子 Logo（纯绘制）
-        logo_label = QLabel("🦆")
+        logo_label = QLabel()
+        logo_label.setPixmap(app_icon().pixmap(22, 22))
         logo_label.setFixedSize(28, 28)
         logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         logo_label.setStyleSheet("""
             QLabel {
-                background: #F5A623;
-                border-radius: 14px;
-                font-size: 14px;
+                background: transparent;
             }
         """)
         left_layout.addWidget(logo_label)
@@ -822,7 +916,7 @@ class TitleBar(QWidget):
         right_layout.addWidget(self.source_label)
 
         # 更新检查
-        self.update_btn = QPushButton("⟳ 检查更新")
+        self.update_btn = QPushButton("检查更新")
         self.update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.update_btn.setStyleSheet("""
             QPushButton {
@@ -842,13 +936,15 @@ class TitleBar(QWidget):
         # 分隔
         sep = QFrame()
         sep.setFixedWidth(1)
-        sep.setStyleSheet("background: rgba(255,255,255,0.15);")
+        sep.setStyleSheet("QFrame { background: rgba(255,255,255,0.15); }")
         right_layout.addWidget(sep)
 
         # 窗口控制按钮
         self.min_btn = self._make_win_btn("—", "#F5C53D")
-        self.max_btn = self._make_win_btn("□", "#42C84E")
-        self.close_btn = self._make_win_btn("✕", "#E74C3C")
+        self.max_btn = self._make_win_btn("", "#42C84E")
+        self.close_btn = self._make_win_btn("", "#E74C3C")
+        set_icon(self.max_btn, "box", 14, "#FFFFFF")
+        set_icon(self.close_btn, "close", 14, "#FFFFFF")
 
         right_layout.addWidget(self.min_btn)
         right_layout.addWidget(self.max_btn)
@@ -1041,8 +1137,9 @@ class VersionCard(QFrame):
         layout.addWidget(text_widget)
         layout.addStretch()
 
-        icon_lbl = QLabel(icon)
-        icon_lbl.setStyleSheet("font-size: 36px; opacity: 0.3;")
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(ui_icons.icon_pixmap(icon, 36, "#FFFFFF"))
+        icon_lbl.setFixedSize(36, 36)
         layout.addWidget(icon_lbl)
 
         self.setStyleSheet(f"""
@@ -1118,15 +1215,13 @@ class GroupBox(QFrame):
         layout.setSpacing(0)
 
         header = QFrame()
-        header.setStyleSheet(f"background: {COLOR_BG_GRAY}; border-top-left-radius: 12px; border-top-right-radius: 12px;")
+        header.setStyleSheet(f"QFrame {{ background: {COLOR_BG_GRAY}; border-top-left-radius: 12px; border-top-right-radius: 12px; }}")
         header.setFixedHeight(42)
         h_layout = QHBoxLayout(header)
         h_layout.setContentsMargins(16, 0, 16, 0)
 
         if icon:
-            icon_lbl = QLabel(icon)
-            icon_lbl.setStyleSheet(f"color: {COLOR_BLUE}; font-size: 16px;")
-            h_layout.addWidget(icon_lbl)
+            h_layout.addWidget(icon_label(icon, 16, COLOR_BLUE))
 
         title_lbl = QLabel(title)
         title_lbl.setStyleSheet(f"font-size: 13px; font-weight: 600; color: {COLOR_TEXT_PRIMARY};")
@@ -1180,10 +1275,11 @@ class SidebarItem(QPushButton):
         layout.setContentsMargins(14, 0, 14, 0)
         layout.setSpacing(10)
 
-        icon_lbl = QLabel(icon)
-        icon_lbl.setFixedSize(20, 20)
-        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(icon_lbl)
+        self._icon_name = icon
+        self._icon_lbl = QLabel()
+        self._icon_lbl.setFixedSize(20, 20)
+        self._icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._icon_lbl)
 
         text_lbl = QLabel(text)
         layout.addWidget(text_lbl)
@@ -1208,6 +1304,8 @@ class SidebarItem(QPushButton):
         self._update_style()
 
     def _update_style(self):
+        _c = "#FFFFFF" if self._active else "#4A90D9"
+        self._icon_lbl.setPixmap(ui_icons.icon_pixmap(self._icon_name, 18, _c))
         if self._active:
             self.setStyleSheet(f"""
                 QPushButton {{
@@ -1293,11 +1391,11 @@ class DownloadPage(QWidget):
         cards_layout = QHBoxLayout()
         cards_layout.setSpacing(12)
 
-        self.card_release = VersionCard("最新正式版", "加载中...", "", COLOR_BLUE, "✓")
+        self.card_release = VersionCard("最新正式版", "加载中...", "", COLOR_BLUE, "check")
         self.card_release.clicked.connect(self._show_detail)
         cards_layout.addWidget(self.card_release)
 
-        self.card_snapshot = VersionCard("最新预览版", "加载中...", "", COLOR_ORANGE, "⚗")
+        self.card_snapshot = VersionCard("最新预览版", "加载中...", "", COLOR_ORANGE, "flask")
         self.card_snapshot.clicked.connect(self._show_detail)
         cards_layout.addWidget(self.card_snapshot)
 
@@ -1322,7 +1420,8 @@ class DownloadPage(QWidget):
         self.detail_title.setStyleSheet(f"font-size: 18px; font-weight: 600;")
         detail_header.addWidget(self.detail_title)
         detail_header.addStretch()
-        close_btn = QPushButton("✕")
+        close_btn = QPushButton("")
+        set_icon(close_btn, "close", 14, "#666666")
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.setFixedSize(24, 24)
         close_btn.setStyleSheet("border: none; font-size: 16px;")
@@ -1392,7 +1491,7 @@ class DownloadPage(QWidget):
         # 操作按钮
         btn_row = QHBoxLayout()
         btn_row.setSpacing(12)
-        self.download_btn = QPushButton("⬇ 开始下载")
+        self.download_btn = QPushButton("开始下载")
         self.download_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.download_btn.setStyleSheet(f"""
             QPushButton {{
@@ -1500,8 +1599,8 @@ class DownloadPage(QWidget):
             visible = content.isVisible()
             content.setVisible(not visible)
             header.setText(
-                header.text().replace("▼" if not visible else "▶", "▶" if not visible else "▼")
-                if "▼" in header.text() or "▶" in header.text()
+                header.text().replace("收起" if not visible else "展开", "展开" if not visible else "收起")
+                if "收起" in header.text() or "展开" in header.text()
                 else header.text()
             )
 
@@ -1626,7 +1725,7 @@ class DownloadPage(QWidget):
         icon = QLabel(icon_char)
         icon.setFixedSize(28, 28)
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon.setStyleSheet(f"background: {icon_bg}; color: {icon_color}; border-radius: 6px; font-size: 12px; font-weight: 700;")
+        icon.setStyleSheet(f"QLabel {{ background: {icon_bg}; color: {icon_color}; border-radius: 6px; font-size: 12px; font-weight: 700; }}")
         layout.addWidget(icon)
 
         # 版本信息
@@ -1653,7 +1752,7 @@ class DownloadPage(QWidget):
             os.path.join(version_dir, f"{version['id']}.jar")
         )
 
-        btn = QPushButton("✓ 已下载" if is_downloaded else "⬇ 下载")
+        btn = QPushButton("已下载" if is_downloaded else "下载")
         btn.setFixedSize(80, 28)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         if is_downloaded:
@@ -1849,7 +1948,36 @@ class QueuePage(QWidget):
             }}
         """)
 
+        # 整体进度（所有任务按文件数聚合）
+        overall = QFrame()
+        overall.setStyleSheet(f"QFrame {{ background: {COLOR_BG_GRAY}; border-radius: 10px; }}")
+        o_layout = QVBoxLayout(overall)
+        o_layout.setContentsMargins(16, 12, 16, 12)
+        o_layout.setSpacing(8)
+        o_row = QHBoxLayout()
+        self.overall_label = QLabel("整体进度 · 暂无任务")
+        self.overall_label.setStyleSheet(f"font-size: 13px; font-weight: 600; color: {COLOR_TEXT_PRIMARY};")
+        o_row.addWidget(self.overall_label)
+        o_row.addStretch()
+        self.overall_pct = QLabel("0%")
+        self.overall_pct.setStyleSheet(f"font-size: 13px; font-weight: 600; color: {COLOR_BLUE};")
+        o_row.addWidget(self.overall_pct)
+        o_layout.addLayout(o_row)
+        self.overall_bar = QProgressBar()
+        self.overall_bar.setFixedHeight(8)
+        self.overall_bar.setRange(0, 100)
+        self.overall_bar.setValue(0)
+        self.overall_bar.setTextVisible(False)
+        self.overall_bar.setStyleSheet(f"""
+            QProgressBar {{ background: {COLOR_BG_GRAY_DARK}; border: none; border-radius: 4px; }}
+            QProgressBar::chunk {{ background: {COLOR_BLUE}; border-radius: 4px; }}
+        """)
+        o_layout.addWidget(self.overall_bar)
+        layout.addWidget(overall)
+
         self.container = QWidget()
+        self.container.setObjectName("queueContainer")
+        self.container.setStyleSheet("QWidget#queueContainer { background: #FFFFFF; }")
         self.container_layout = QVBoxLayout(self.container)
         self.container_layout.setContentsMargins(0, 0, 0, 0)
         self.container_layout.setSpacing(12)
@@ -1876,11 +2004,52 @@ class QueuePage(QWidget):
         self._task_widgets[version] = task
 
     def update_task(self, version: str, status: str, progress: int,
-                    total: int, speed: float, current_file: str = ""):
+                    total: int, speed: float, current_file: str = "",
+                    phase: str = "", files_done: int = None,
+                    files_total: int = None):
         """更新任务状态"""
         task = self._task_widgets.get(version)
         if task:
-            task.update_state(status, progress, total, speed, current_file)
+            task.update_state(status, progress, total, speed, current_file,
+                              phase=phase, files_done=files_done,
+                              files_total=files_total)
+            self.refresh_overall()
+
+    def update_stage(self, version: str, name: str, done: int, total: int):
+        task = self._task_widgets.get(version)
+        if task:
+            task.update_stage(name, done, total)
+
+    def refresh_overall(self):
+        """按文件数聚合所有任务的总进度（未开始的任务按已获知任务的均值预估）。"""
+        cards = list(self._task_widgets.values())
+        if not cards:
+            self.overall_label.setText("整体进度 · 暂无任务")
+            self.overall_pct.setText("0%")
+            self.overall_bar.setValue(0)
+            return
+        known = [c._files_total for c in cards if c._files_total]
+        est = (sum(known) / len(known)) if known else 500
+        done_sum = 0.0
+        total_sum = 0.0
+        completed = 0
+        for c in cards:
+            if c._status == "completed":
+                done_sum += 1
+                total_sum += 1
+                completed += 1
+                continue
+            ft = c._files_total or est
+            fd = c._files_done if c._status == "downloading" else 0
+            done_sum += min(fd, ft)
+            total_sum += ft
+        pct = int(done_sum / total_sum * 100) if total_sum else 0
+        pct = max(0, min(99, pct)) if completed < len(cards) else 100
+        self.overall_bar.setValue(pct)
+        self.overall_pct.setText(f"{pct}%")
+        self.overall_label.setText(
+            f"整体进度 · 已完成 {completed}/{len(cards)} 个任务 · "
+            f"{int(done_sum)}/{int(total_sum)} 个文件")
 
     def remove_task(self, version: str):
         task = self._task_widgets.pop(version, None)
@@ -1897,6 +2066,12 @@ class DownloadTaskCard(QFrame):
         super().__init__(parent)
         self._version = version
         self._subtitle = subtitle
+        self._status = "queued"
+        self._phase = ""
+        self._stage_done = 0
+        self._stage_total = 0
+        self._files_done = 0
+        self._files_total = 0
         self._build_ui()
 
     def _build_ui(self):
@@ -1914,10 +2089,11 @@ class DownloadTaskCard(QFrame):
 
         # 头部
         header = QHBoxLayout()
-        icon = QLabel("⬇")
+        icon = QLabel()
+        icon.setPixmap(ui_icons.icon_pixmap("download", 18, COLOR_BLUE))
         icon.setFixedSize(32, 32)
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon.setStyleSheet(f"background: {COLOR_BLUE_BG}; color: {COLOR_BLUE}; border-radius: 8px; font-size: 16px;")
+        icon.setStyleSheet(f"QLabel {{ background: {COLOR_BLUE_BG}; border-radius: 8px; }}")
         header.addWidget(icon)
 
         info = QWidget()
@@ -1981,6 +2157,21 @@ class DownloadTaskCard(QFrame):
         info_row.addWidget(self.speed_label)
         layout.addLayout(info_row)
 
+        # 当前阶段
+        self.phase_label = QLabel("")
+        self.phase_label.setStyleSheet(f"font-size: 11px; color: {COLOR_BLUE}; font-weight: 500;")
+        layout.addWidget(self.phase_label)
+
+        self.stage_bar = QProgressBar()
+        self.stage_bar.setFixedHeight(4)
+        self.stage_bar.setRange(0, 100)
+        self.stage_bar.setTextVisible(False)
+        self.stage_bar.setStyleSheet(f"""
+            QProgressBar {{ background: {COLOR_BG_GRAY_DARK}; border: none; border-radius: 2px; }}
+            QProgressBar::chunk {{ background: {COLOR_BLUE}; border-radius: 2px; }}
+        """)
+        layout.addWidget(self.stage_bar)
+
         # 当前文件
         self.current_file_label = QLabel("")
         self.current_file_label.setStyleSheet(f"font-size: 11px; color: {COLOR_TEXT_TERTIARY};")
@@ -2010,15 +2201,48 @@ class DownloadTaskCard(QFrame):
         btn_row.addWidget(self.cancel_btn)
         layout.addLayout(btn_row)
 
+    def _phase_text(self) -> str:
+        if not self._phase:
+            return ""
+        if self._stage_total > 0:
+            pct = min(100, int(self._stage_done / self._stage_total * 100))
+            return f"阶段：{self._phase} · {self._stage_done}/{self._stage_total}（{pct}%）"
+        if self._stage_done:
+            return f"阶段：{self._phase} · 已完成 {self._stage_done} 个文件"
+        return f"阶段：{self._phase}（进行中）"
+
+    def update_stage(self, name: str, done: int, total: int):
+        self._phase = name or self._phase
+        self._stage_done, self._stage_total = done, total
+        if self._status == "downloading":
+            self.phase_label.setText(self._phase_text())
+            self.stage_bar.setValue(
+                int(self._stage_done / self._stage_total * 100) if self._stage_total else 0)
+
     def update_state(self, status: str, progress: int, total: int,
-                     speed: float, current_file: str = ""):
+                     speed: float, current_file: str = "",
+                     phase: str = "", files_done: int = None,
+                     files_total: int = None):
+        self._status = status
+        if files_done is not None:
+            self._files_done = files_done
+        if files_total is not None:
+            self._files_total = files_total
+        if phase:
+            self._phase = phase
+            self.phase_label.setText(self._phase_text())
         if total > 0:
             pct = int(progress / total * 100)
         else:
             pct = 0
         self.progress_bar.setValue(pct)
 
-        self.file_info.setText(f"{fmt_size(progress)} / {fmt_size(total)} · {pct}%")
+        if self._files_total:
+            self.file_info.setText(
+                f"{self._files_done}/{self._files_total} 个文件 · "
+                f"{fmt_size(progress)} / {fmt_size(total)} · {pct}%")
+        else:
+            self.file_info.setText(f"{fmt_size(progress)} / {fmt_size(total)} · {pct}%")
         self.speed_label.setText(f"{speed:.1f} MB/s")
         if current_file:
             self.current_file_label.setText(f"当前: {current_file}")
@@ -2026,6 +2250,7 @@ class DownloadTaskCard(QFrame):
             self.current_file_label.setText("")
 
         if status == "queued":
+            self.phase_label.setText("等待开始")
             self.status_label.setText("排队中")
             self.status_label.setStyleSheet(f"""
                 background: {COLOR_BG_GRAY_DARK};
@@ -2116,7 +2341,7 @@ class SettingsPage(QWidget):
         container_layout.addWidget(title)
 
         # ── 下载源 ──
-        source_group = GroupBox("下载源", "🌐")
+        source_group = GroupBox("下载源", "globe")
         source_combo = QComboBox()
         source_combo.addItem("BMCLAPI（国内镜像）", SOURCE_BMCLAPI)
         source_combo.addItem("Mojang 官方源", SOURCE_MOJANG)
@@ -2135,7 +2360,7 @@ class SettingsPage(QWidget):
         container_layout.addWidget(source_group)
 
         # ── 下载性能 ──
-        dl_group = GroupBox("下载性能", "⬇")
+        dl_group = GroupBox("下载性能", "download")
 
         spin_workers = QSpinBox()
         spin_workers.setRange(1, 64)
@@ -2216,7 +2441,7 @@ class SettingsPage(QWidget):
         container_layout.addWidget(dl_group)
 
         # ── 游戏目录 ──
-        path_group = GroupBox("游戏目录", "📁")
+        path_group = GroupBox("游戏目录", "folder")
 
         dir_edit = QLineEdit(self.settings.mc_directory)
         dir_edit.setPlaceholderText("留空 = 程序所在目录下的 .minecraft")
@@ -2261,7 +2486,7 @@ class SettingsPage(QWidget):
         container_layout.addWidget(path_group)
 
         # ── Java ──
-        java_group = GroupBox("Java（安装 Mod 加载器时需要）", "☕")
+        java_group = GroupBox("Java（安装 Mod 加载器时需要）", "java")
 
         java_edit = QLineEdit(self.settings.java_path)
         java_edit.setPlaceholderText("留空 = 自动检测（Mojang 运行时 / 系统 Java）")
@@ -2298,7 +2523,7 @@ class SettingsPage(QWidget):
         container_layout.addWidget(java_group)
 
         # ── 自更新 ──
-        update_group = GroupBox("自更新", "🔄")
+        update_group = GroupBox("自更新", "refresh")
 
         auto_toggle = ToggleSwitch(checked=self.settings.auto_check_update)
         auto_toggle.toggled.connect(
@@ -2495,10 +2720,11 @@ class AboutPage(QWidget):
         layout.setSpacing(16)
 
         # Logo
-        logo = QLabel("🦆")
+        logo = QLabel()
+        logo.setPixmap(app_icon().pixmap(96, 96))
         logo.setFixedSize(72, 72)
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo.setStyleSheet(f"background: {COLOR_ORANGE}; border-radius: 36px; font-size: 36px;")
+        logo.setStyleSheet("QLabel { background: transparent; }")
         layout.addWidget(logo, alignment=Qt.AlignmentFlag.AlignCenter)
 
         name = QLabel("DMDP")
@@ -2565,8 +2791,9 @@ class DMDPWindow(QMainWindow):
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.Window
         )
+        self.setWindowIcon(app_icon())
         self.resize(self.settings.window_width, self.settings.window_height)
-        self.setStyleSheet(f"background: {COLOR_BG_WHITE};")
+        self.setStyleSheet(f"DMDPWindow {{ background: {COLOR_BG_WHITE}; }}")
 
         # 下载任务管理
         self._workers = {}          # version -> DownloadWorker（当前运行的那个）
@@ -2637,8 +2864,9 @@ class DMDPWindow(QMainWindow):
 
         # 左侧边栏
         sidebar = QWidget()
+        sidebar.setObjectName("sidebar")
         sidebar.setFixedWidth(180)
-        sidebar.setStyleSheet(f"background: {COLOR_BG_GRAY}; border-right: 1px solid {COLOR_BORDER};")
+        sidebar.setStyleSheet(f"QWidget#sidebar {{ background: {COLOR_BG_GRAY}; border-right: 1px solid {COLOR_BORDER}; }}")
         sb_layout = QVBoxLayout(sidebar)
         sb_layout.setContentsMargins(8, 12, 8, 12)
         sb_layout.setSpacing(4)
@@ -2653,8 +2881,8 @@ class DMDPWindow(QMainWindow):
 
         self.sidebar_items = []
         for icon, text, page_idx in [
-            ("🎮", "原版游戏", 0),
-            ("⭐", "收藏夹", 0),
+            ("gamepad", "原版游戏", 0),
+            ("star", "收藏夹", 0),
         ]:
             item = SidebarItem(icon, text)
             item.set_active(page_idx == 0)
@@ -2665,7 +2893,7 @@ class DMDPWindow(QMainWindow):
         # 分隔线
         sep = QFrame()
         sep.setFixedHeight(1)
-        sep.setStyleSheet(f"background: {COLOR_BORDER}; margin: 8px 12px;")
+        sep.setStyleSheet(f"QFrame {{ background: {COLOR_BORDER}; margin: 8px 12px; }}")
         sb_layout.addWidget(sep)
 
         tool_label = QLabel("工具")
@@ -2676,8 +2904,8 @@ class DMDPWindow(QMainWindow):
         sb_layout.addWidget(tool_label)
 
         for icon, text, page_idx, badge in [
-            ("📋", "下载队列", 1, "0"),
-            ("⚙", "设置", 2, ""),
+            ("list", "下载队列", 1, "0"),
+            ("gear", "设置", 2, ""),
         ]:
             item = SidebarItem(icon, text, badge=badge)
             item.clicked.connect(lambda checked, idx=page_idx: self._switch_page(idx))
@@ -2710,7 +2938,7 @@ class DMDPWindow(QMainWindow):
     def _create_status_bar(self) -> QWidget:
         bar = QFrame()
         bar.setFixedHeight(36)
-        bar.setStyleSheet(f"background: {COLOR_BG_GRAY}; border-top: 1px solid {COLOR_BORDER};")
+        bar.setStyleSheet(f"QFrame {{ background: {COLOR_BG_GRAY}; border-top: 1px solid {COLOR_BORDER}; }}")
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(20, 0, 20, 0)
         layout.setSpacing(20)
@@ -2791,10 +3019,19 @@ class DMDPWindow(QMainWindow):
             item.set_active(page_map.get(idx) == i if i < 2 else idx == (i + 1))
 
     def _toggle_maximize(self):
-        if self.isMaximized():
-            self.showNormal()
-        else:
-            self.showMaximized()
+        """最大化到屏幕可用区域（保留任务栏），不是全屏。"""
+        if getattr(self, "_maxed", False):
+            self._maxed = False
+            if getattr(self, "_normal_geo", None):
+                self.setGeometry(self._normal_geo)
+            self.title_bar.max_btn.setToolTip("最大化")
+            return
+        self._normal_geo = self.geometry()
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        self.setGeometry(avail)
+        self._maxed = True
+        self.title_bar.max_btn.setToolTip("还原")
 
     # ─── 版本列表 ───
 
@@ -2847,8 +3084,16 @@ class DMDPWindow(QMainWindow):
         if self._active is None:
             self._start_next()
 
+    MAX_CONCURRENT_TASKS = 2
+
     def _start_next(self):
-        if self._active is not None or not self._pending:
+        while self._pending and len(self._workers) < self.MAX_CONCURRENT_TASKS:
+            self._start_one()
+        if not self._workers:
+            return
+
+    def _start_one(self):
+        if not self._pending:
             return
         task = self._pending.popleft()
         version = task["version"]
@@ -2868,12 +3113,16 @@ class DMDPWindow(QMainWindow):
         worker.detail_changed.connect(
             lambda fname, done, total, v=version: self._on_file_info(v, fname, done, total)
         )
+        worker.stage_changed.connect(
+            lambda name, done, total, v=version: self.queue_page.update_stage(v, name, done, total)
+        )
         worker.download_finished.connect(self._on_download_finished)
         worker.error_occurred.connect(self._on_download_error)
 
         self._workers[version] = worker
         self._active = worker
-        self._active_version = version
+        if self._active_version is None:
+            self._active_version = version
         self._progress[version] = {"done": 0, "total": 0, "speed": 0.0, "file": ""}
 
         self.status_ready.setText(f"● 正在安装 {version}")
@@ -2888,11 +3137,19 @@ class DMDPWindow(QMainWindow):
             version, status,
             int(info.get("done", 0)), int(info.get("total", 0)),
             float(info.get("speed", 0.0)), info.get("file", ""),
+            phase=info.get("phase", ""),
+            files_done=info.get("files_done"),
+            files_total=info.get("files_total"),
         )
 
     def _on_download_status(self, version: str, text: str):
         if version == self._active_version:
             self.status_progress_text.setText(text)
+        info = self._progress.setdefault(
+            version, {"done": 0, "total": 0, "speed": 0.0, "file": "",
+                      "phase": "", "files_done": 0, "files_total": 0}
+        )
+        info["phase"] = str(text)
         self._update_task_card(version)
 
     def _on_download_progress(self, version: str, current: int, total: int):
@@ -2935,8 +3192,10 @@ class DMDPWindow(QMainWindow):
         self._workers.pop(version, None)
         self._progress.pop(version, None)
         if version == self._active_version:
-            self._active = None
             self._active_version = None
+        self._active = next(iter(self._workers.values()), None) if self._workers else None
+        if self._active_version is None and self._workers:
+            self._active_version = next(iter(self._workers.keys()))
         self.status_progress_bar.setVisible(False)
 
         # 刷新「已下载」标记
@@ -2955,8 +3214,10 @@ class DMDPWindow(QMainWindow):
         self._workers.pop(version, None)
         self._progress.pop(version, None)
         if version == self._active_version:
-            self._active = None
             self._active_version = None
+        self._active = next(iter(self._workers.values()), None)
+        if self._active_version is None and self._workers:
+            self._active_version = next(iter(self._workers.keys()))
 
         if self._pending:
             QTimer.singleShot(300, self._start_next)
@@ -2987,7 +3248,7 @@ class DMDPWindow(QMainWindow):
     # ─── 更新检查 ───
 
     def check_for_update(self):
-        self.title_bar.update_btn.setText("⟳ 检查中...")
+        self.title_bar.update_btn.setText("检查中…")
         self._update_checker = UpdateChecker(self.settings.update_channel)
         self._update_checker.update_found.connect(self._on_update_found)
         self._update_checker.no_update.connect(self._on_no_update)
@@ -2995,7 +3256,7 @@ class DMDPWindow(QMainWindow):
         self._update_checker.start()
 
     def _on_update_found(self, version: str, page: str, asset: str, size: int, kind: str = "zip"):
-        self.title_bar.update_btn.setText("✦ 有新版本")
+        self.title_bar.update_btn.setText("有新版本")
         self._pending_update = (version, page, asset, size, kind)
         from PyQt6.QtWidgets import QMessageBox
 
@@ -3129,7 +3390,7 @@ class DMDPWindow(QMainWindow):
         QApplication.quit()
 
     def _on_no_update(self):
-        self.title_bar.update_btn.setText("⟳ 检查更新")
+        self.title_bar.update_btn.setText("检查更新")
         from PyQt6.QtWidgets import QMessageBox
         QMessageBox.information(
             self, "已是最新版本",
@@ -3137,7 +3398,7 @@ class DMDPWindow(QMainWindow):
         )
 
     def _on_update_error(self, error: str):
-        self.title_bar.update_btn.setText("⟳ 检查更新")
+        self.title_bar.update_btn.setText("检查更新")
 
     # ─── 窗口事件 ───
 
@@ -3477,6 +3738,7 @@ def main():
     app.setApplicationVersion(APP_VERSION)
 
     # 设置 Fusion 风格 + 自定义调色板
+    app.setWindowIcon(app_icon())
     app.setStyle(QStyleFactory.create("Fusion"))
     palette = QPalette()
     palette.setColor(QPalette.ColorRole.Window, QColor(COLOR_BG_WHITE))
