@@ -1,5 +1,5 @@
 Unicode true
-Name "DMDP 1.1.1"
+Name "DMDP 1.1.2"
 OutFile "DMDP.exe.new"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
@@ -12,7 +12,7 @@ Section "Main"
     FileOpen $0 "$EXEDIR\DMDP\VERSION" r
     FileRead $0 $1
     FileClose $0
-    StrCmp $1 "1.1.1" 0 reextract
+    StrCmp $1 "1.1.2" 0 reextract
     Goto launch
   reextract:
     RMDir /r "$EXEDIR\DMDP"
@@ -20,7 +20,7 @@ Section "Main"
     SetOutPath "$EXEDIR\DMDP"
     File /r "payload\*"
     FileOpen $0 "$EXEDIR\DMDP\VERSION" w
-    FileWrite $0 "1.1.1"
+    FileWrite $0 "1.1.2"
     FileClose $0
   launch:
     SetOutPath "$EXEDIR"
