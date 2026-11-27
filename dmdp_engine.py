@@ -60,7 +60,7 @@ from minecraft_launcher_lib.natives import get_natives, extract_natives_file
 # ═══════════════════════════════════════════════════════════════
 
 APP_NAME = "DMDP"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 USER_AGENT = f"DMDP/{APP_VERSION}"
 
 SOURCE_BMCLAPI = "bmclapi"

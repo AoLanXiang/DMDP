@@ -1,0 +1,4 @@
+// 给启动器 DMDP.exe 嵌入程序图标（鸭子）
+// 编译：x86_64-w64-mingw32-windres launcher.rc -O coff -o launcher.res
+// 链接：x86_64-w64-mingw32-gcc -O2 -municode -mwindows -static -o DMDP.exe launcher.c launcher.res
+1 ICON "app.ico"

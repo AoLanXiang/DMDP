@@ -1,7 +1,7 @@
 Unicode true
 !include "MUI2.nsh"
-Name "DMDP 1.1.2"
-OutFile "DMDP-1.1.2-setup.exe"
+Name "DMDP 1.1.3"
+OutFile "DMDP-1.1.3-setup.exe"
 InstallDir "$LOCALAPPDATA\Programs\DMDP"
 InstallDirRegKey HKCU "Software\DMDP" "InstallDir"
 RequestExecutionLevel user
@@ -24,7 +24,7 @@ Section "Install"
   CreateShortCut "$SMPROGRAMS\DMDP\DMDP.lnk" "$INSTDIR\DMDP.exe"
   CreateShortCut "$SMPROGRAMS\DMDP\卸载 DMDP.lnk" "$INSTDIR\uninstall.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DMDP" "DisplayName" "DMDP"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DMDP" "DisplayVersion" "1.1.2"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DMDP" "DisplayVersion" "1.1.3"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DMDP" "Publisher" "AoLanXiang"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DMDP" "DisplayIcon" "$INSTDIR\DMDP.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DMDP" "UninstallString" '"$INSTDIR\uninstall.exe"'
